@@ -35,7 +35,8 @@
             [lambdaisland.glogi :as log]
             [frontend.fs.capacitor-fs :as capacitor-fs]
             ["@capawesome/capacitor-background-task" :refer [BackgroundTask]]
-            ["path" :as node-path]))
+            ["path" :as node-path]
+            [logseq.common.path :as path]))
 
 ;;; ### Commentary
 ;; file-sync related local files/dirs:
@@ -719,6 +720,7 @@
   (<get-local-all-files-meta [this graph-uuid base-path] "get all local files' metadata")
   (<rename-local-file [this graph-uuid base-path from to])
   (<update-local-files [this graph-uuid base-path filepaths] "remote -> local")
+  (<fetch-remote-files [this graph-uuid base-path filepaths] "remote -> local version-db")
   (<download-version-files [this graph-uuid base-path filepaths])
   (<delete-local-files [this graph-uuid base-path filepaths])
   (<update-remote-files [this graph-uuid base-path filepaths local-txid] "local -> remote, return err or txid")
@@ -850,6 +852,13 @@
       (<! (<rsapi-cancel-all-requests))
       (let [token (<! (<get-token this))]
         (<! (p->c (ipc/ipc "update-local-files" graph-uuid base-path filepaths token))))))
+  (<fetch-remote-files [this graph-uuid base-path filepaths]
+    (println "fetch-remote-files" graph-uuid base-path filepaths)
+    (go
+      (<! (<rsapi-cancel-all-requests))
+      (let [token (<! (<get-token this))]
+        (<! (p->c (ipc/ipc "fetch-remote-files" graph-uuid base-path filepaths token))))))
+
   (<download-version-files [this graph-uuid base-path filepaths]
     (go
       (let [token (<! (<get-token this))
@@ -944,7 +953,9 @@
                                                                      :basePath base-path
                                                                      :filePaths filepaths'
                                                                      :token token})))))))
-
+  (<fetch-remote-files [this graph-uuid base-path filepaths]
+    (js/console.error "unimpl")
+    (prn ::todo))
   (<download-version-files [this graph-uuid base-path filepaths]
     (go
       (let [token (<! (<get-token this))
@@ -1539,6 +1550,49 @@
                            delete-filetxns)]
     (set (concat update-file-items rename-file-items delete-file-items))))
 
+
+(defn- <fetch-remote-and-update-local-files
+  [graph-uuid base-path relative-paths]
+  (go
+    (let [fetched-file-rpaths (<! (<fetch-remote-files rsapi graph-uuid base-path relative-paths))]
+      (p->c (p/all (->> fetched-file-rpaths
+                        (map (fn [rpath]
+                               (p/let [incoming-file (path/path-join "logseq/version-files/incoming" rpath)
+                                       base-file (path/path-join "logseq/version-files/base" rpath)
+                                       current-change-file rpath
+                                       repo-url (state/get-current-repo)
+                                       repo-dir (config/get-repo-dir repo-url)
+                                       current-exists? (fs/file-exists? current-change-file)
+                                       base-exists? (fs/file-exists? base-file)]
+                                 (cond
+                                   base-exists?
+                                   (p/let [base-content (fs/read-file repo-dir base-file)
+                                           current-content (fs/read-file repo-dir current-change-file)]
+                                     (if (= base-content current-content)
+                                       (do
+                                         (prn "base=current, should do a 2-way merge")
+                                         (fs/copy! repo-url
+                                                   (path/path-join repo-dir incoming-file)
+                                                   (path/path-join repo-dir current-change-file)))
+                                       (do
+                                         (prn "base!=current, should do a 3-way merge")
+                                         (fs/copy! repo-url
+                                                   (path/path-join repo-dir incoming-file)
+                                                   (path/path-join repo-dir current-change-file)))))
+
+                                   :else
+                                   (do
+                                     (prn "no base, copy")
+                                     (prn ::copy incoming-file current-change-file)
+                                     (fs/copy! repo-url
+                                               (path/path-join repo-dir incoming-file)
+                                               (path/path-join repo-dir current-change-file))
+                                     (fs/copy! repo-url
+                                               (path/path-join repo-dir incoming-file)
+                                               (path/path-join repo-dir base-file)))))))))))))
+  
+
+
 (defn- apply-filetxns
   [*sync-state graph-uuid base-path filetxns *paused]
   (go
@@ -1574,7 +1628,7 @@
                 (swap! *sync-state sync-state--remove-recent-remote->local-files
                        [recent-remote->local-file-item])))))
 
-        (let [update-local-files-ch (<update-local-files rsapi graph-uuid base-path (map relative-path filetxns))
+        (let [update-local-files-ch (<fetch-remote-and-update-local-files graph-uuid base-path (map relative-path filetxns))
               r (<! (<with-pause update-local-files-ch *paused))]
           (doseq [[filetxn origin-db-content] txn->db-content-vec]
             (when (<! (need-add-version-file? filetxn origin-db-content))
